@@ -77,7 +77,14 @@ static int waitingOnDevice = 0;
 int SchedulerEntryPoint(void* arg)
 {
     // TODO: check for kernel mode
-
+    uint32_t psr = get_psr();
+    int kernelMode = psr & PSR_KERNEL_MODE != 0;
+    if (!kernelMode)
+    {
+        console_output(FALSE, "SchedulerEntryPoint called in kernel mode. Halting...\n");
+        stop(1);
+    }
+    
     /* Disable interrupts */
     disableInterrupts();
 
@@ -106,9 +113,10 @@ int SchedulerEntryPoint(void* arg)
     InitializeHandlers();
 
     enableInterrupts();
-
+    
     /* TODO: Create a process for Messaging, then block on a wait until messaging exits.*/
-
+    MessagingEntryPoint(0);
+    k_wait(0);
     k_exit(0);
 
     return 0;
