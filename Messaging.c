@@ -417,38 +417,38 @@ int wait_device(char* deviceName, int* status)
 {
     int result = 0;
     uint32_t deviceHandle = -1;
-    checkKernelMode("waitdevice");
+	checkKernelMode("waitdevice"); // checking the PSR for kernel mode
 
     enableInterrupts();
 
-    if (strcmp(deviceName, "clock") == 0)
+	if (strcmp(deviceName, "clock") == 0) // if the device name is "clock", set the device handle to the predefined clock device id
     {
-        deviceHandle = THREADS_CLOCK_DEVICE_ID;
+		deviceHandle = THREADS_CLOCK_DEVICE_ID; // set the device handle to the predefined clock device id
     }
     else
     {
-        deviceHandle = device_handle(deviceName);
+		deviceHandle = device_handle(deviceName); // for other device names, call the device_handle function to get the corresponding device handle based on the provided device name string
 
     }
 
-    if (deviceHandle >= 0 && deviceHandle < THREADS_MAX_DEVICES)
+	if (deviceHandle >= 0 && deviceHandle < THREADS_MAX_DEVICES) // if the device handle is valid, block on the device's mailbox to wait for an interrupt and receive the device status
     {
         /* set a flag that there is a process waiting on a device. */
         waitingOnDevice++;
-        mailbox_receive(devices[deviceHandle].deviceMbox, status, sizeof(int), TRUE);
+		mailbox_receive(devices[deviceHandle].deviceMbox, status, sizeof(int), TRUE); // block on the device's mailbox until the interrupt handler sends the device status to the mailbox, and store the received status in the provided status pointer
 
-        disableInterrupts();
+		disableInterrupts(); // disable interrupts while updating the waitingOnDevice flag to prevent
 
-        waitingOnDevice--;
+		waitingOnDevice--; // decrement the flag to indicate that the process is no longer waiting on a device after receiving the status from the device's mailbox
     }
     else
     {
-        console_output(FALSE, "Unknown device type.");
+		console_output(FALSE, "Unknown device type."); // if the device name is not recognized, output an error message and halt the process
         stop(-1);
     }
 
-    /* spec says return -5 if signaled. */
-    if (signaled())
+    
+	if (signaled()) // if the process was signaled while waiting, set the result to -5 to indicate that it was interrupted by a signal
     {
         result = -5;
     }
