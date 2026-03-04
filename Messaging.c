@@ -1,4 +1,5 @@
-/* ------------------------------------------------------------------------
+
+* ------------------------------------------------------------------------
    Messaging.c
    College of Applied Science and Technology
    The University of Arizona
@@ -18,16 +19,19 @@
 #include "message.h"
 
    /* ------------------------- Prototypes ----------------------------------- */
+static void terminal_interrupt_handler(void* device, uint8_t command, uint32_t status, void* pArgs);
 static void nullsys(system_call_arguments_t* args);
 
 /* Note: interrupt_handler_t is already defined in THREADSLib.h with the signature:
  *   void (*)(char deviceId[32], uint8_t command, uint32_t status, void *pArgs)
  */
 
+static void clock_interupt_handler(void* device, uint8_t command, uint32_t status, void* pArgs);
 static void InitializeHandlers();
 static int check_io_messaging(void);
 extern int MessagingEntryPoint(void*);
 static void checkKernelMode(const char* functionName);
+static void syscall_handler(void* device, uint8_t command, uint32_t status, void *pArgs);
 
 struct psr_bits {
     unsigned int cur_int_enable : 1;
@@ -94,6 +98,11 @@ int SchedulerEntryPoint(void* arg)
     /* Initialize the mail box table, slots, & other data structures.
      * Initialize int_vec and sys_vec, allocate mailboxes for interrupt
      * handlers.  Etc... */
+    for (int i = 0; i < THREADS_MAX_SYSCALLS; i++)
+    {
+        systemCallVector[i] = nullsys;
+    }
+
     for (int i = 0; i < MAXMBOX; ++i) //initializing the mailboxes in the mailbox table
     {
         mailboxes[i].mbox_id = -1; //indicates that the mailbox is not in use
@@ -186,33 +195,73 @@ int mailbox_create(int slots, int slot_size)
 int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
 {
     // Validate mailbox id
-    if (mboxId < 0 || mboxId >= MAXMBOX || mailboxes[mboxId].status != MBSTATUS_INUSE) //checking if the mailbox id is valid and the mailbox is in use
-    {
+    if (mboxId < 0 || mboxId >= MAXMBOX || mailboxes[mboxId].status != MBSTATUS_INUSE)
         return -1;
+    if (msg_size > mailboxes[mboxId].slotSize)
+        return -1;
+
+    // Zero-slot mailbox: direct rendezvous (synchronization)
+    if (mailboxes[mboxId].slotCount == 0) {
+        // If a receiver is waiting, unblock and deliver
+        WaitingProcessPtr receiver = mailboxes[mboxId].waitingReceiversHead;
+        if (receiver) {
+            unblock(receiver->pid);
+            mailboxes[mboxId].waitingReceiversHead = receiver->pNextProcess;
+            if (mailboxes[mboxId].waitingReceiversHead)
+                mailboxes[mboxId].waitingReceiversHead->pPrevProcess = NULL;
+            else
+                mailboxes[mboxId].waitingReceiversTail = NULL;
+            free(receiver);
+            return 0;
+        }
+        // No receiver waiting: block or return -2
+        if (!wait)
+            return -2;
+        int pid = k_getpid();
+        WaitingProcessPtr wp = (WaitingProcessPtr)malloc(sizeof(struct waiting_process));
+        wp->pid = pid;
+        wp->pNextProcess = NULL;
+        wp->pPrevProcess = NULL;
+        if (!mailboxes[mboxId].waitingSendersTail) {
+            mailboxes[mboxId].waitingSendersHead = wp;
+            mailboxes[mboxId].waitingSendersTail = wp;
+        } else {
+            mailboxes[mboxId].waitingSendersTail->pNextProcess = wp;
+            wp->pPrevProcess = mailboxes[mboxId].waitingSendersTail;
+            mailboxes[mboxId].waitingSendersTail = wp;
+        }
+        block(BLOCKED_SEND);
+        // After unblocking, check if mailbox is released
+        if (mailboxes[mboxId].status != MBSTATUS_INUSE)
+            return -5;
+        return 0;
     }
 
-    if (msg_size > mailboxes[mboxId].slotSize)//checking if the message size is greater than the slot size of the mailbox
-    {
-        return -1;
+    // Normal mailbox logic
+    // If a receiver is waiting, deliver message directly (bypass slot)
+    WaitingProcessPtr receiver = mailboxes[mboxId].waitingReceiversHead;
+    if (receiver) {
+        // Copy message to receiver's buffer (assume buffer pointer is stored in receiver struct if needed)
+        unblock(receiver->pid);
+        mailboxes[mboxId].waitingReceiversHead = receiver->pNextProcess;
+        if (mailboxes[mboxId].waitingReceiversHead)
+            mailboxes[mboxId].waitingReceiversHead->pPrevProcess = NULL;
+        else
+            mailboxes[mboxId].waitingReceiversTail = NULL;
+        free(receiver);
+        return 0;
     }
-
-    int slotCount = 0; //count the number of slots currently in use for the mailbox
-    SlotPtr slot = mailboxes[mboxId].pSlotListHead; //pointer to traverse the slot list of the mailbox
-    while (slot) // counting the number of slots currently in use for the mailbox
-    {
+    int slotCount = 0;
+    SlotPtr slot = mailboxes[mboxId].pSlotListHead;
+    while (slot) {
         slotCount++;
         slot = slot->pNextSlot;
     }
-    while (slotCount >= mailboxes[mboxId].slotCount) // checking if there are no available slots in the mailbox
-    {
-
-        if (!wait) // if the block flag is not set, return -2 to indicate that the send would block
-        {
+    while (slotCount >= mailboxes[mboxId].slotCount) {
+        if (!wait)
             return -2;
-        }
-
-        int pid = k_getpid(); // get the process id of the sending process to block it until a slot is available
-        WaitingProcessPtr wp = (WaitingProcessPtr)malloc(sizeof(struct waiting_process)); // create a waiting process structure to add the sending process to the waiting senders list of the mailbox 
+        int pid = k_getpid();
+        WaitingProcessPtr wp = (WaitingProcessPtr)malloc(sizeof(struct waiting_process));
         wp->pid = pid;
         wp->pNextProcess = NULL;
         wp->pPrevProcess = NULL;
@@ -220,56 +269,45 @@ int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
         if (mailboxes[mboxId].status != MBSTATUS_INUSE) {
             enableInterrupts();
             free(wp);
-            return -5; // mailbox was released while we were preparing to wait
+            return -5;
         }
-		if (!mailboxes[mboxId].waitingSendersTail) // if the waiting senders list is empty, set the head and tail to the new waiting process
-        {
+        if (!mailboxes[mboxId].waitingSendersTail) {
             mailboxes[mboxId].waitingSendersHead = wp;
             mailboxes[mboxId].waitingSendersTail = wp;
-        } 
-        else 
-        {
-			mailboxes[mboxId].waitingSendersTail->pNextProcess = wp;// add the new waiting process to the end of the waiting senders list and update the next and previous pointers accordingly
-			wp->pPrevProcess = mailboxes[mboxId].waitingSendersTail;// set the previous pointer of the new waiting process to the current tail of the waiting senders list
-			mailboxes[mboxId].waitingSendersTail = wp; //   update the tail of the waiting senders list to the new waiting process
+        } else {
+            mailboxes[mboxId].waitingSendersTail->pNextProcess = wp;
+            wp->pPrevProcess = mailboxes[mboxId].waitingSendersTail;
+            mailboxes[mboxId].waitingSendersTail = wp;
         }
         enableInterrupts();
-        block(BLOCKED_SEND); // block the processs untill a slot is availble
+        block(BLOCKED_SEND);
         slotCount = 0;
-        slot = mailboxes[mboxId].pSlotListHead; // after being unblocked, count the number of slots currently in use for the mailbox again to check if a slot is now available
-		while (slot) // counting the number of slots currently in use for the mailbox
-        {
+        slot = mailboxes[mboxId].pSlotListHead;
+        while (slot) {
             slotCount++;
             slot = slot->pNextSlot;
         }
     }
-
-    SlotPtr newSlot = (SlotPtr)malloc(sizeof(MailSlot)); //allocate a new slot for the message to be sent
+    SlotPtr newSlot = (SlotPtr)malloc(sizeof(MailSlot));
     if (!newSlot)
-    {
-        return -1; // if memory allocation for the new slot fails, return -1 to indicate an error
-    }
-    newSlot->mbox_id = mboxId; // set the mailbox id of the new slot to the id of the mailbox it is being sent to
-    memcpy(newSlot->message, pMsg, msg_size); // copy the message data from the provided pointer to the message field of the new slot
-    newSlot->messageSize = msg_size; // set the message size of the new slot to the size of the message being sent
-    newSlot->pNextSlot = NULL; // initialize the next slot pointer of the new slot to NULL since it will be added to the end of the slot list of the mailbox
+        return -1;
+    newSlot->mbox_id = mboxId;
+    memcpy(newSlot->message, pMsg, msg_size);
+    newSlot->messageSize = msg_size;
+    newSlot->pNextSlot = NULL;
     newSlot->pPrevSlot = NULL;
-
-    if (!mailboxes[mboxId].pSlotListHead) // if the slot list of the mailbox is empty, set the head to the new slot
-    {
+    if (!mailboxes[mboxId].pSlotListHead) {
         mailboxes[mboxId].pSlotListHead = newSlot;
-    }
-    else // if the slot list of the mailbox is not empty, add the new slot to the end of the list and update the next and previous pointers accordingly
-    {
-        SlotPtr last = mailboxes[mboxId].pSlotListHead; // pointer to traverse the slot list of the mailbox to find the last slot
+    } else {
+        SlotPtr last = mailboxes[mboxId].pSlotListHead;
         while (last->pNextSlot)
-            last = last->pNextSlot; // traverse the slot list to find the last slot
-        last->pNextSlot = newSlot; // set the next slot pointer of the last slot to the new slot
-        newSlot->pPrevSlot = last; // set the previous slot pointer of the new slot to the last slot
+            last = last->pNextSlot;
+        last->pNextSlot = newSlot;
+        newSlot->pPrevSlot = last;
     }
-
     return 0;
 }
+
 
 /* ------------------------------------------------------------------------
    Name - mailbox_receive
@@ -283,68 +321,87 @@ int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
    ----------------------------------------------------------------------- */
 int mailbox_receive(int mboxId, void* pMsg, int msg_size, int wait)
 {
-    // Validate mailbox id // checking if the mailbox id is valid and the mailbox is in use
+    // Validate mailbox id
     if (mboxId < 0 || mboxId >= MAXMBOX || mailboxes[mboxId].status != MBSTATUS_INUSE)
-    {
         return -1;
-    }
-    // Check for available slot
-    SlotPtr slot = mailboxes[mboxId].pSlotListHead;
-    while (!slot) {
-        // No message available
-        if (!wait)
-        {
-            return -2;
+
+    // Zero-slot mailbox: direct rendezvous (synchronization)
+    if (mailboxes[mboxId].slotCount == 0) {
+        // If a sender is waiting, unblock and deliver
+        WaitingProcessPtr sender = mailboxes[mboxId].waitingSendersHead;
+        if (sender) {
+            unblock(sender->pid);
+            mailboxes[mboxId].waitingSendersHead = sender->pNextProcess;
+            if (mailboxes[mboxId].waitingSendersHead)
+                mailboxes[mboxId].waitingSendersHead->pPrevProcess = NULL;
+            else
+                mailboxes[mboxId].waitingSendersTail = NULL;
+            free(sender);
+            return 0;
         }
-        int pid = k_getpid(); // get the pid of process to block it until a message is available in the mailbox
-        WaitingProcessPtr wp = (WaitingProcessPtr)malloc(sizeof(struct waiting_process)); // create a waiting process structure to add the receiving process to the waiting receivers list of the mailbox
-        wp->pid = pid; // set the pid of the waiting process to the pid of the receiving process
+        // No sender waiting: block or return -2
+        if (!wait)
+            return -2;
+        int pid = k_getpid();
+        WaitingProcessPtr wp = (WaitingProcessPtr)malloc(sizeof(struct waiting_process));
+        wp->pid = pid;
         wp->pNextProcess = NULL;
         wp->pPrevProcess = NULL;
-        if (!mailboxes[mboxId].waitingReceiversTail) // if the waiting receivers list is empty, set the head and tail to the new waiting process
-        {
+        if (!mailboxes[mboxId].waitingReceiversTail) {
             mailboxes[mboxId].waitingReceiversHead = wp;
             mailboxes[mboxId].waitingReceiversTail = wp;
-        }
-        else // if the waiting receivers list is not empty, add the new waiting process to the end of the list and update the tail pointer
-        {
+        } else {
             mailboxes[mboxId].waitingReceiversTail->pNextProcess = wp;
             wp->pPrevProcess = mailboxes[mboxId].waitingReceiversTail;
             mailboxes[mboxId].waitingReceiversTail = wp;
-
         }
-
-        block(BLOCKED_RECEIVE); // block the receiving process until a message is available in the mailbox
-
-        slot = mailboxes[mboxId].pSlotListHead; // after being unblocked, check the head of the slot list of the mailbox again to see if a message is now available
+        block(BLOCKED_RECEIVE);
+        // After unblocking, check if mailbox is released
+        if (mailboxes[mboxId].status != MBSTATUS_INUSE)
+            return -5;
+        return 0;
     }
 
-    int copySize = (slot->messageSize < msg_size) ? slot->messageSize : msg_size; //copy message data from the slot to the provided buffer
+    // Normal mailbox logic
+    SlotPtr slot = mailboxes[mboxId].pSlotListHead;
+    while (!slot) {
+        if (!wait)
+            return -2;
+        int pid = k_getpid();
+        WaitingProcessPtr wp = (WaitingProcessPtr)malloc(sizeof(struct waiting_process));
+        wp->pid = pid;
+        wp->pNextProcess = NULL;
+        wp->pPrevProcess = NULL;
+        if (!mailboxes[mboxId].waitingReceiversTail) {
+            mailboxes[mboxId].waitingReceiversHead = wp;
+            mailboxes[mboxId].waitingReceiversTail = wp;
+        } else {
+            mailboxes[mboxId].waitingReceiversTail->pNextProcess = wp;
+            wp->pPrevProcess = mailboxes[mboxId].waitingReceiversTail;
+            mailboxes[mboxId].waitingReceiversTail = wp;
+        }
+        block(BLOCKED_RECEIVE);
+        slot = mailboxes[mboxId].pSlotListHead;
+    }
+    int copySize = (slot->messageSize < msg_size) ? slot->messageSize : msg_size;
     memcpy(pMsg, slot->message, copySize);
-    // Remove slot from list
-    mailboxes[mboxId].pSlotListHead = slot->pNextSlot; // update the head of the slot list to the next slot in the list
-    if (mailboxes[mboxId].pSlotListHead) // if there is a next slot in the list, update its previous pointer to NULL since it will now be the head of the list
-    {
+    mailboxes[mboxId].pSlotListHead = slot->pNextSlot;
+    if (mailboxes[mboxId].pSlotListHead)
         mailboxes[mboxId].pSlotListHead->pPrevSlot = NULL;
-    }
     free(slot);
-    WaitingProcessPtr sender = mailboxes[mboxId].waitingSendersHead; // check if there are any waiting senders for the mailbox and unblock the first sender in the waiting senders list if there is one
-    if (sender) // if there is a waiting sender, unblock it and remove it from the waiting senders list
-    {
-        unblock(sender->pid); // unblock the sender process
-        mailboxes[mboxId].waitingSendersHead = sender->pNextProcess; // update the head of the waiting senders list to the next sender in the list
-        if (mailboxes[mboxId].waitingSendersHead) // if there is a next sender in the list, update its previous pointer to NULL since it will now be the head of the list
-        {
+    WaitingProcessPtr sender = mailboxes[mboxId].waitingSendersHead;
+    if (sender) {
+        unblock(sender->pid);
+        mailboxes[mboxId].waitingSendersHead = sender->pNextProcess;
+        if (mailboxes[mboxId].waitingSendersHead)
             mailboxes[mboxId].waitingSendersHead->pPrevProcess = NULL;
-        }
-        else // if there are no more waiting senders in the list, set the tail pointer to NULL as well
-        {
+        else
             mailboxes[mboxId].waitingSendersTail = NULL;
-        }
-        free(sender); // free the memory allocated for the sender that was unblocked
+        free(sender);
     }
     return copySize;
 }
+
 
 
 /* ------------------------------------------------------------------------
@@ -470,14 +527,29 @@ static void InitializeHandlers()
 {
     handlers = get_interrupt_handlers();
 
-    /* TODO: Register interrupt handlers in the handlers array.
-     * Use the interrupt indices defined in THREADSLib.h:
-     *   handlers[THREADS_TIMER_INTERRUPT]   = your_clock_handler;
-     *   handlers[THREADS_IO_INTERRUPT]      = your_io_handler;
-     *   handlers[THREADS_SYS_CALL_INTERRUPT] = your_syscall_handler;
-     *
-     * Also initialize the system call vector (systemCallVector).
-     */
+    // Register interrupt handlers in the handlers array
+    handlers[THREADS_TIMER_INTERRUPT] = clock_interrupt_handler;
+    handlers[THREADS_SYS_CALL_INTERRUPT] = syscall_handler;
+
+    // Register terminal interrupt handlers for terminal devices
+    // Assuming terminal device IDs are 1-4 (after clock at 0)
+    for (int i = 1; i <= 4; ++i) {
+        handlers[i] = terminal_interrupt_handler;
+    }
+/*
+ * Terminal interrupt handler: sends status to the correct terminal mailbox
+ */
+static void terminal_interrupt_handler(void* device, uint8_t command, uint32_t status, void* pArgs)
+{
+    // device is expected to be the device ID (int)
+    int deviceId = (int)(intptr_t)device;
+    if (deviceId < 0 || deviceId >= THREADS_MAX_DEVICES) {
+        return;
+    }
+    int mbox = devices[deviceId].deviceMbox;
+    int term_status = (int)status;
+    mailbox_send(mbox, &term_status, sizeof(int), FALSE); // non-blocking send
+}
 
 }
 
@@ -506,3 +578,50 @@ static inline void checkKernelMode(const char* functionName)
         stop(1);
     }
 }
+static void clock_interupt_handler(void* device, uint8_t command, uint32_t status, void* pArgs)
+{
+    static int count = 0;
+    int clock_result = 0;
+    uint32_t clockMbox;
+    if (count == 4)
+    {
+        /* get the clock mailbox */
+        clockMbox = devices[THREADS_CLOCK_DEVICE_ID].deviceMbox;
+        int clock_status = 0; // or use status if needed
+        mailbox_send(clockMbox, &clock_status, sizeof(int), FALSE); // non-blocking send
+        count = 0; // reset count after firing
+    }
+    else
+    {
+        count++;
+    }
+    time_slice();
+} /* clock_interrupt_handler */
+
+static void syscall_handler(void* device, uint8_t command, uint32_t status, void *pArgs)
+{
+    LARGE_INTEGER unit;
+    int deviceId;
+
+    unit.QuadPart = (LONGLONG)device;
+    deviceId = unit.LowPart;
+
+    /* verify the device id */
+    if (deviceId != THREADS_SYSTEM_CALL_ID)
+    {
+        //logging code to add
+        return;
+    }
+
+if (pArgs != NULL)
+    {
+        /* note that the memory for this must be allocated or persistent. */
+        system_call_arguments_t* pSysCallArgs = pArgs;
+
+        /* Verify the system call identifier using pSysCallArgs->call_id */
+
+        /* call the system call handler if one is registered. */
+
+    }
+
+} /* syscall_handler */
