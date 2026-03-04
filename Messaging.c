@@ -1,4 +1,3 @@
-
 * ------------------------------------------------------------------------
    Messaging.c
    College of Applied Science and Technology
@@ -128,10 +127,17 @@ int SchedulerEntryPoint(void* arg)
         if (i == THREADS_CLOCK_DEVICE_ID) continue; // already created mailbox for clock device
         devices[i].deviceMbox = mailbox_create(1, sizeof(int));
     }
-    /* TODO: Initialize the devices using device_initialize().
-     * The devices are: disk0, disk1, term0, term1, term2, term3.
-     * Store the device handle and name in the devices array.
-     */
+    // Initialize the devices using device_initialize().
+    // The devices are: disk0, disk1, term0, term1, term2, term3.
+    // Store the device handle and name in the devices array.
+    const char* deviceNames[] = {"disk0", "disk1", "term0", "term1", "term2", "term3"};
+    for (int i = 0; i < 6; ++i) {
+        uint32_t handle = device_initialize((char*)deviceNames[i]);
+        devices[i].deviceHandle = (void*)(intptr_t)handle;
+        strncpy(devices[i].deviceName, deviceNames[i], sizeof(devices[i].deviceName) - 1);
+        devices[i].deviceName[sizeof(devices[i].deviceName) - 1] = '\0';
+        devices[i].deviceType = i < 2 ? 0 : 1; // 0: disk, 1: terminal
+    }
 
     InitializeHandlers();
 
