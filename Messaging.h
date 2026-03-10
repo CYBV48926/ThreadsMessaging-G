@@ -1,15 +1,15 @@
 #pragma once
 
- /*
-  * Maximum line length. Used by terminal read and write.
-  */
+/*
+ * Maximum line length. Used by terminal read and write.
+ */
 #define MAXLINE         80
 
-#define MAXMBOX         2000 /* 500 */
+#define MAXMBOX         2000/* 500 */
 #define MAXSLOTS        2500 /* 5000 */
 #define MAX_MESSAGE     256  /* largest possible message in a single slot */
 
-/* returns id of mailbox, or -1 if no more mailboxes or error */
+ /* returns id of mailbox, or -1 if no more mailboxes or error */
 int mailbox_create(int slots, int slot_size);
 
 typedef struct mqattr {
@@ -27,7 +27,7 @@ typedef struct mqattr {
                           int mqOpen(char *name, int oflags, MqAttributes *pAttrs);
                        */
 
-/* returns 0 if successful, -1 if invalid arg */
+                       /* returns 0 if successful, -1 if invalid arg */
 extern int mailbox_free(int mbox_id);
 
 /* returns 0 if successful, -1 if invalid args */
@@ -53,4 +53,3 @@ typedef struct sysargs
 } sysargs;
 
 extern void  (*systemCallVector[])(system_call_arguments_t* args);
-
