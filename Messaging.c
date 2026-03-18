@@ -815,6 +815,40 @@ int mailbox_free(int mboxId)
     while (wp) { blockedCount++; wp = wp->pNextProcess; }
     wp = mailboxes[mboxId].waitingReceiversHead;
     while (wp) { blockedCount++; wp = wp->pNextProcess; }
+    
+    // If no blocked processes, just clean up and return
+    if (blockedCount == 0) {
+        enableInterrupts();
+        // ...existing code for cleanup...
+        disableInterrupts();
+        mailboxes[mboxId].waitingSendersHead = mailboxes[mboxId].waitingSendersTail = NULL;
+        mailboxes[mboxId].waitingReceiversHead = mailboxes[mboxId].waitingReceiversTail = NULL;
+        SlotPtr slot = mailboxes[mboxId].pSlotListHead;
+        while (slot) {
+            SlotPtr next = slot->pNextSlot;
+            free(slot);
+            globalSlotsInUse--;
+            slot = next;
+        }
+        mailboxes[mboxId].pSlotListHead = NULL;
+        mailboxes[mboxId].mbox_id = -1;
+        mailboxes[mboxId].slotCount = 0;
+        mailboxes[mboxId].slotSize = 0;
+        mailboxes[mboxId].type = MB_ZEROSLOT;
+        mailboxes[mboxId].status = MBSTATUS_EMPTY;
+        enableInterrupts();
+        if (signaled())
+            return -5;
+        return 0;
+    }
+
+    // Track number of processes unblocked on this mailbox
+    static int unblockedOnMailbox = 0;
+    static int freeingPid = -1;
+    if (freeingPid == -1) {
+        freeingPid = k_getpid();
+        unblockedOnMailbox = 0;
+    }
 
     // Unblock all waiting senders
     wp = mailboxes[mboxId].waitingSendersHead;
@@ -834,52 +868,44 @@ int mailbox_free(int mboxId)
 
     enableInterrupts();
 
-    // Yield blockedCount * 2 times:
-    //   Each blocked process needs up to 2 yields to fully complete and
-    //   be collected by the parent before mailbox_free returns.
-    // The last process exits AFTER mailbox_free returns per expected ordering.
-    // Using blockedCount * 2 gives all processes (including complex ones like
-    // Child1 with OPTION_RECEIVE_FIRST that do extra work after -5) enough
-    // dispatcher time to finish before the freeing process prints its result.
-    int yields = blockedCount * 2;
-    for (int i = 0; i < yields; i++)
-    {
-        dispatcher();
-    }
+    // Yield to let blocked processes run and return -5
+    dispatcher();
 
     // Re-disable interrupts for cleanup
     disableInterrupts();
-
     mailboxes[mboxId].waitingSendersHead = mailboxes[mboxId].waitingSendersTail = NULL;
     mailboxes[mboxId].waitingReceiversHead = mailboxes[mboxId].waitingReceiversTail = NULL;
-
-    // Free all slots and return them to the global pool
     SlotPtr slot = mailboxes[mboxId].pSlotListHead;
     while (slot) {
         SlotPtr next = slot->pNextSlot;
         free(slot);
-        globalSlotsInUse--; /* return slot to global pool */
+        globalSlotsInUse--;
         slot = next;
     }
     mailboxes[mboxId].pSlotListHead = NULL;
-
-    // Reset mailbox fields
     mailboxes[mboxId].mbox_id = -1;
     mailboxes[mboxId].slotCount = 0;
     mailboxes[mboxId].slotSize = 0;
     mailboxes[mboxId].type = MB_ZEROSLOT;
-    
-    // Set status to EMPTY so the mailbox can be reused
     mailboxes[mboxId].status = MBSTATUS_EMPTY;
-    
     enableInterrupts();
-    
-    // Check if current process was signaled during cleanup
-    if (signaled())
-    {
+
+    // If this is a process that was unblocked by mailbox_free, return -5
+    if (signaled()) {
+        // Increment the count of unblocked processes
+        unblockedOnMailbox++;
+        // If this is the last process unblocked, unblock the freer
+        if (unblockedOnMailbox == blockedCount && freeingPid != -1) {
+            unblock(freeingPid);
+            freeingPid = -1;
+            unblockedOnMailbox = 0;
+        }
         return -5;
     }
 
+    // If this is the freeing process, after all unblocked processes have run
+    freeingPid = -1;
+    unblockedOnMailbox = 0;
     return 0;
 } /* mailbox_free */
 
@@ -1127,4 +1153,4 @@ static void io_handler(void* device, uint8_t command, uint32_t status, void* pAr
         console_output(FALSE, "Failed to send I/O status to mailbox for device %d. Error code: %d\n",
             deviceId, result);
     }
-} /* io_handler */
+} /* io_handler */m
