@@ -815,7 +815,7 @@ int mailbox_free(int mboxId)
     while (wp) { blockedCount++; wp = wp->pNextProcess; }
     wp = mailboxes[mboxId].waitingReceiversHead;
     while (wp) { blockedCount++; wp = wp->pNextProcess; }
-    
+
     // If no blocked processes, just clean up and return
     if (blockedCount == 0) {
         enableInterrupts();
@@ -842,50 +842,37 @@ int mailbox_free(int mboxId)
         return 0;
     }
 
-    // Track number of processes unblocked on this mailbox
-    static int unblockedOnMailbox = 0;
-    static int freeingPid = -1;
-    if (freeingPid == -1) {
-        freeingPid = k_getpid();
-        unblockedOnMailbox = 0;
-    }
-
-    // Collect all waiting processes (senders and receivers) into an array for sorting by priority
-    int totalBlocked = 0;
-    WaitingProcessPtr blockedList[MAXSLOTS * 2]; // Should be enough for all blocked
+    // Unblock all blocked processes (senders and receivers) in FIFO order
     wp = mailboxes[mboxId].waitingSendersHead;
     while (wp) {
-        blockedList[totalBlocked++] = wp;
+        unblock(wp->pid);
         wp = wp->pNextProcess;
     }
     wp = mailboxes[mboxId].waitingReceiversHead;
     while (wp) {
-        blockedList[totalBlocked++] = wp;
+        unblock(wp->pid);
         wp = wp->pNextProcess;
-    }
-
-    // Sort blockedList by priority (lower PID = higher priority as a simple heuristic)
-    for (int i = 0; i < totalBlocked - 1; ++i) {
-        for (int j = i + 1; j < totalBlocked; ++j) {
-            if (blockedList[j]->pid < blockedList[i]->pid) {
-                WaitingProcessPtr tmp = blockedList[i];
-                blockedList[i] = blockedList[j];
-                blockedList[j] = tmp;
-            }
-        }
-    }
-
-    // Unblock in priority order
-    for (int i = 0; i < totalBlocked; ++i) {
-        unblock(blockedList[i]->pid);
     }
 
     enableInterrupts();
 
-    // Yield to let blocked processes run and return -5
-    dispatcher();
+    // Block itself if any previously blocked process hasn't returned yet
+    // Use a static counter to track how many have returned
+    static int mailboxFree_unblocked = 0;
+    static int mailboxFree_blockedCount = 0;
+    static int mailboxFree_freerPid = -1;
+    if (mailboxFree_freerPid == -1) {
+        mailboxFree_freerPid = k_getpid();
+        mailboxFree_blockedCount = blockedCount;
+        mailboxFree_unblocked = 0;
+    }
 
-    // Re-disable interrupts for cleanup
+    // Block the freeing process if there are any blocked processes
+    if (mailboxFree_blockedCount > 0) {
+        block(0); // Block itself until all previously blocked processes return
+    }
+
+    // Cleanup after all blocked processes have returned
     disableInterrupts();
     mailboxes[mboxId].waitingSendersHead = mailboxes[mboxId].waitingSendersTail = NULL;
     mailboxes[mboxId].waitingReceiversHead = mailboxes[mboxId].waitingReceiversTail = NULL;
@@ -904,30 +891,23 @@ int mailbox_free(int mboxId)
     mailboxes[mboxId].status = MBSTATUS_EMPTY;
     enableInterrupts();
 
-    // If this is a process that was unblocked by mailbox_free, return -5
+    // If this is a process that was unblocked by mailbox_free, return -5 and increment counter
     if (signaled()) {
-        // Increment the count of unblocked processes
-        static int lastBlockedCount = 0;
-        static int lastFreeingPid = -1;
-        if (lastBlockedCount == 0 || lastFreeingPid == -1) {
-            lastBlockedCount = blockedCount;
-            lastFreeingPid = freeingPid;
-        }
-        unblockedOnMailbox++;
-        // If this is the last process unblocked, unblock the freer
-        if (unblockedOnMailbox == lastBlockedCount && lastFreeingPid != -1) {
-            unblock(lastFreeingPid);
-            lastFreeingPid = -1;
-            lastBlockedCount = 0;
-            freeingPid = -1;
-            unblockedOnMailbox = 0;
+        mailboxFree_unblocked++;
+        // If this is the last process, unblock the freeing process
+        if (mailboxFree_unblocked == mailboxFree_blockedCount && mailboxFree_freerPid != -1) {
+            unblock(mailboxFree_freerPid);
+            mailboxFree_freerPid = -1;
+            mailboxFree_blockedCount = 0;
+            mailboxFree_unblocked = 0;
         }
         return -5;
     }
 
-    // If this is the freeing process, after all unblocked processes have run
-    freeingPid = -1;
-    unblockedOnMailbox = 0;
+    // Reset static variables for next mailbox_free call
+    mailboxFree_freerPid = -1;
+    mailboxFree_blockedCount = 0;
+    mailboxFree_unblocked = 0;
     return 0;
 } /* mailbox_free */
 
@@ -1175,4 +1155,4 @@ static void io_handler(void* device, uint8_t command, uint32_t status, void* pAr
         console_output(FALSE, "Failed to send I/O status to mailbox for device %d. Error code: %d\n",
             deviceId, result);
     }
-} /* io_handler */m
+} /* io_handler */
