@@ -907,10 +907,18 @@ int mailbox_free(int mboxId)
     // If this is a process that was unblocked by mailbox_free, return -5
     if (signaled()) {
         // Increment the count of unblocked processes
+        static int lastBlockedCount = 0;
+        static int lastFreeingPid = -1;
+        if (lastBlockedCount == 0 || lastFreeingPid == -1) {
+            lastBlockedCount = blockedCount;
+            lastFreeingPid = freeingPid;
+        }
         unblockedOnMailbox++;
         // If this is the last process unblocked, unblock the freer
-        if (unblockedOnMailbox == blockedCount && freeingPid != -1) {
-            unblock(freeingPid);
+        if (unblockedOnMailbox == lastBlockedCount && lastFreeingPid != -1) {
+            unblock(lastFreeingPid);
+            lastFreeingPid = -1;
+            lastBlockedCount = 0;
             freeingPid = -1;
             unblockedOnMailbox = 0;
         }
